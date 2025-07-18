@@ -1,0 +1,22 @@
+# Fichiers Python et environnements
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/                  # Votre environnement virtuel Python
+env/                   # Un autre nom courant pour l'environnement virtuel
+
+# Fichiers spécifiques au système d'exploitation
+.DS_Store              # macOS
+Thumbs.db              # Windows
+ehthumbs.db            # Windows
+Desktop.ini            # Windows
+
+# Fichiers de configuration sensibles
+.env                   # Fichier de variables d'environnement (contient les secrets de DB et JWT)
+
+# Logs et autres fichiers générés
+*.log
+*.sqlite
+/instance/             # Dossier souvent utilisé par Flask pour les données spécifiques à l'instance
