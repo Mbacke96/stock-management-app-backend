@@ -5,75 +5,110 @@ from dotenv import load_dotenv
 import os
 import pymysql
 from werkzeug.security import generate_password_hash, check_password_hash
-import jwt
+import jwt # Utilisé ici pour le décodage manuel dans token_required
 import datetime
-from functools import wraps # Pour créer le décorateur @login_required
+from functools import wraps
+from urllib.parse import urlparse # Pour parser l'URL de la base de données
 
-# Charger les variables d'environnement depuis .env
+# Import Flask-JWT-Extended
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, verify_jwt_in_request
+
+# Charger les variables d'environnement depuis .env (pour le développement local)
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app) # Permet à ton front-end (React) de communiquer avec cette API
 
-# Ajoute une clé secrète pour signer tes JWT dans ton .env
-# Génère une chaîne aléatoire forte pour cela, ex: os.urandom(24).hex()
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'super_secret_dev_key_change_me_in_prod')
+# --- Configuration des clés secrètes et JWT ---
+# Utilise la variable d'environnement pour la clé secrète de Flask
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "your_flask_secret_key_for_dev") 
 
-# Configuration de la base de données MySQL
-db_config = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'your_mysql_password'), # REMPLACE 'your_mysql_password' PAR TON MOT DE PASSE MYSQL !
-    'database': os.getenv('DB_NAME', 'stock_db')
-}
+# Utilise la variable d'environnement pour la clé secrète JWT
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "your_jwt_secret_key_for_dev") 
+jwt_manager = JWTManager(app) # Initialise Flask-JWT-Extended
 
-# --- Décorateur pour protéger les routes ---
+# --- Configuration CORS ---
+# Récupère l'URL du frontend à partir des variables d'environnement
+# Pour Render, cela sera FRONTEND_URL=https://stock-ra6zpzlvy-mbacke96s-projects.vercel.app
+frontend_url = os.environ.get("FRONTEND_URL")
+
+# Si FRONTEND_URL n'est pas défini (par exemple, en dev local), utilisez localhost
+# Pour le déploiement, assurez-vous que FRONTEND_URL est bien défini sur Render.
+if frontend_url:
+    origins_list = [frontend_url]
+else:
+    origins_list = ["http://localhost:3000"] # Fallback pour le développement local
+
+# Pour une sécurité accrue, assurez-vous de n'inclure que les domaines autorisés.
+CORS(app, resources={r"/*": {"origins": origins_list}})
+
+
+# --- Fonction de connexion à la base de données ---
+def get_db_connection():
+    """Établit et retourne une connexion à la base de données en utilisant les variables d'environnement."""
+    try:
+        # Tente de récupérer l'URL complète de la base de données
+        # Render fournit généralement une DATABASE_URL pour MySQL.
+        # Heroku peut utiliser CLEARDB_DATABASE_URL ou JAWSDB_URL, etc.
+        db_url = os.environ.get("DATABASE_URL") # Nom commun pour Render
+        if not db_url:
+            db_url = os.environ.get("CLEARDB_DATABASE_URL") # Nom commun pour Heroku avec ClearDB
+        if not db_url:
+            db_url = os.environ.get("JAWSDB_MARIA_URL") # Nom commun pour Heroku avec JawsDB
+
+        if db_url:
+            # Si l'URL contient un schéma comme mysql://user:pass@host:port/db
+            url = urlparse(db_url)
+            return pymysql.connect(
+                host=url.hostname,
+                user=url.username,
+                password=url.password,
+                database=url.path[1:], # Retire le slash initial
+                port=url.port if url.port else 3306 # Port par défaut MySQL
+            )
+        else:
+            # Fallback pour le développement local avec des variables séparées
+            # (assurez-vous qu'elles sont définies dans votre .env local)
+            return pymysql.connect(
+                host=os.environ.get("MYSQL_HOST", "localhost"),
+                user=os.environ.get("MYSQL_USER", "root"),
+                password=os.environ.get("MYSQL_PASSWORD", ""),
+                database=os.environ.get("MYSQL_DB", "stock_db")
+            )
+    except pymysql.MySQLError as e:
+        print(f"Erreur de connexion à la base de données : {e}")
+        return None
+
+# --- Décorateur pour protéger les routes (maintenu pour compatibilité) ---
+# Note: Flask-JWT-Extended a son propre @jwt_required() qui est plus intégré
+# mais votre implémentation ici est fonctionnelle et inclut la récupération de l'utilisateur.
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        # Les tokens sont généralement envoyés dans l'en-tête Authorization
-        if 'Authorization' in request.headers:
-            token = request.headers['Authorization'].split(" ")[1] # Bearer <token>
-
-        if not token:
-            return jsonify({'message': 'Token manquant !'}), 401
-
+        # Utilisation de verify_jwt_in_request() de Flask-JWT-Extended
+        # pour gérer la vérification du token et l'injecter dans le contexte
         try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            # Récupérer l'utilisateur depuis la base de données
+            verify_jwt_in_request()
+            current_user_identity = get_jwt_identity() # C'est l'ID utilisateur que vous avez mis dans le token
+
             conn = get_db_connection()
             if conn is None:
                 return jsonify({"error": "Erreur de connexion à la base de données"}), 500
             cursor = conn.cursor(pymysql.cursors.DictCursor)
-            cursor.execute("SELECT id, username, role FROM users WHERE id = %s", (data['user_id'],))
+            cursor.execute("SELECT id, username, role FROM users WHERE id = %s", (current_user_identity,))
             current_user = cursor.fetchone()
             cursor.close()
             conn.close()
 
             if not current_user:
-                return jsonify({'message': 'Token invalide ou utilisateur non trouvé !'}), 401
+                return jsonify({'message': 'Utilisateur non trouvé ou token invalide !'}), 401
 
-        except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token expiré !'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'message': 'Token invalide !'}), 401
         except Exception as e:
-            print(f"Erreur lors de la vérification du token: {e}")
-            return jsonify({'message': 'Erreur interne du serveur lors de la vérification du token'}), 500
+            # Flask-JWT-Extended lève des exceptions spécifiques pour les erreurs de token
+            print(f"Erreur lors de la vérification du token Flask-JWT-Extended: {e}")
+            return jsonify({'message': 'Token invalide ou expiré', 'error_detail': str(e)}), 401
 
         return f(current_user, *args, **kwargs) # Passe l'utilisateur courant à la fonction décorée
     return decorated
-
-# --- Fonctions utilitaires de la base de données ---
-def get_db_connection():
-    """Établit et retourne une connexion à la base de données."""
-    try:
-        conn = pymysql.connect(**db_config)
-        return conn
-    except pymysql.MySQLError as e:
-        print(f"Erreur de connexion à la base de données : {e}")
-        return None
 
 # --- Routes d'authentification ---
 
@@ -115,8 +150,9 @@ def register_user():
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de l'enregistrement"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
+
 # Route temporaire pour enregistrer un utilisateur admin
 # !!! ATTENTION: NE PAS UTILISER EN PRODUCTION SANS SÉCURITÉ SUPPLÉMENTAIRE !!!
 # C'est pour la facilité de développement uniquement.
@@ -125,8 +161,7 @@ def register_admin_user_temp():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    # Le rôle est forcé à 'admin' pour cette route temporaire
-    role = 'admin'
+    role = 'admin' # Le rôle est forcé à 'admin' pour cette route temporaire
 
     if not all([username, password]):
         return jsonify({"error": "Nom d'utilisateur et mot de passe sont requis"}), 400
@@ -151,8 +186,9 @@ def register_admin_user_temp():
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de l'enregistrement de l'admin"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
+
 # Connexion de l'utilisateur
 @app.route('/login', methods=['POST'])
 def login_user():
@@ -175,21 +211,18 @@ def login_user():
         if not user or not check_password_hash(user['password_hash'], password):
             return jsonify({"message": "Nom d'utilisateur ou mot de passe incorrect"}), 401
         
-        # Créer un JWT
-        token = jwt.encode({
-            'user_id': user['id'],
-            'username': user['username'],
-            'role': user['role'],
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24) # Expire dans 24h
-        }, app.config['SECRET_KEY'], algorithm="HS256")
+        # Créer un JWT en utilisant Flask-JWT-Extended
+        # La payload par défaut de Flask-JWT-Extended est l'identité de l'utilisateur
+        access_token = create_access_token(identity=user['id'], 
+                                           additional_claims={"username": user['username'], "role": user['role']})
 
-        return jsonify({"message": "Connexion réussie", "token": token, "role": user['role']}), 200
+        return jsonify({"message": "Connexion réussie", "token": access_token, "role": user['role']}), 200
     except pymysql.MySQLError as e:
         print(f"Erreur lors de la connexion : {e}")
         return jsonify({"error": "Erreur serveur lors de la connexion"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # --- Exemple de route protégée (pour tester le décorateur) ---
 @app.route('/protected', methods=['GET'])
@@ -221,8 +254,8 @@ def get_products(current_user):
         print(f"Erreur lors de la récupération des produits : {e}")
         return jsonify({"error": "Erreur serveur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Ajouter un produit
 @app.route('/products', methods=['POST'])
@@ -256,8 +289,8 @@ def add_product(current_user):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de l'ajout du produit"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Mettre à jour un produit
 @app.route('/products/<int:product_id>', methods=['PUT'])
@@ -306,8 +339,8 @@ def update_product(current_user, product_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la mise à jour du produit"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Supprimer un produit
 @app.route('/products/<int:product_id>', methods=['DELETE'])
@@ -334,8 +367,8 @@ def delete_product(current_user, product_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la suppression du produit"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # --- Routes pour les commandes ---
 
@@ -366,8 +399,8 @@ def get_orders(current_user):
         print(f"Erreur lors de la récupération des commandes : {e}")
         return jsonify({"error": "Erreur serveur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Créer une nouvelle commande
 @app.route('/orders', methods=['POST'])
@@ -446,8 +479,8 @@ def create_order(current_user):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la création de la commande"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Mettre à jour le statut d'une commande (ou d'autres champs)
 @app.route('/orders/<int:order_id>', methods=['PUT'])
@@ -496,8 +529,8 @@ def update_order(current_user, order_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la mise à jour de la commande"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Supprimer une commande
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
@@ -526,8 +559,8 @@ def delete_order(current_user, order_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la suppression de la commande"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # --- Routes pour les fournisseurs ---
 
@@ -551,8 +584,8 @@ def get_suppliers(current_user):
         print(f"Erreur lors de la récupération des fournisseurs : {e}")
         return jsonify({"error": "Erreur serveur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Ajouter un fournisseur
 @app.route('/suppliers', methods=['POST'])
@@ -587,8 +620,8 @@ def add_supplier(current_user):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de l'ajout du fournisseur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Mettre à jour un fournisseur
 @app.route('/suppliers/<int:supplier_id>', methods=['PUT'])
@@ -640,8 +673,8 @@ def update_supplier(current_user, supplier_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la mise à jour du fournisseur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # Supprimer un fournisseur
 @app.route('/suppliers/<int:supplier_id>', methods=['DELETE'])
@@ -668,8 +701,11 @@ def delete_supplier(current_user, supplier_id):
         conn.rollback()
         return jsonify({"error": "Erreur serveur lors de la suppression du fournisseur"}), 500
     finally:
-        cursor.close()
-        conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
+# Assurez-vous que le bloc de démarrage utilise le port d'Heroku/Render
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Render (et Heroku) injecte la variable PORT
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False) # Désactivez debug en production
